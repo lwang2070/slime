@@ -765,5 +765,162 @@ def test_force_fp8_ue8m0_scale_argument(monkeypatch):
     assert configured.force_fp8_ue8m0_scale is True
 
 
+@pytest.mark.unit
+def test_custom_config_does_not_override_command_line(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    custom_config = {"grpo_std_normalization": True, "normalize_advantages": True}
+    args = types.SimpleNamespace(grpo_std_normalization=False, normalize_advantages=module._CLI_ABSENT)
+
+    assert module._materialize_custom_config(args, custom_config) == {"normalize_advantages"}
+    assert args.grpo_std_normalization is False
+    assert args.normalize_advantages is True
+
+
+@pytest.mark.unit
+def test_custom_config_wins_over_computed_defaults(monkeypatch):
+    """`_set_default_megatron_args` yields to a key the config file set."""
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(
+        fp16=False,
+        bf16=False,  # the config file's value; the framework default would be True
+        seq_length=8192,
+        max_position_embeddings=None,
+        rope_type=None,
+        multi_latent_attention=False,
+        vocab_size=None,
+        padded_vocab_size=None,
+        tokenizer_model=None,
+        tokenizer_type=None,
+        hf_checkpoint=None,
+    )
+
+    module._set_default_megatron_args(args, configured={"bf16"})
+
+    assert args.bf16 is False  # not overwritten with `not fp16`
+    assert args.seq_length == 8192
+    assert args.max_position_embeddings == 8192
+
+
+@pytest.mark.unit
+def test_custom_config_cli_detection_handles_dest_mismatched_flags(monkeypatch, tmp_path):
+    """`--disable-foo` writes to dest `foo`, so detection cannot match names.
+
+    The YAML key is `foo`, and the flag text is `disable_foo`. Recognizing that
+    the command line supplied it is exactly what a name comparison gets wrong.
+    """
+    module = load_slime_arguments_module(monkeypatch)
+    config = tmp_path / "custom.yaml"
+    config.write_text("grpo_std_normalization: true\nnormalize_advantages: true\n")
+
+    custom_config = module._load_custom_config(str(config))
+    absent_defaults = {key: module._CLI_ABSENT for key in custom_config}
+
+    parser = argparse.ArgumentParser(add_help=False)
+    module.get_slime_extra_args_provider(extra_defaults=absent_defaults)(parser)
+
+    parsed, _ = parser.parse_known_args(["--rollout-batch-size", "1", "--disable-grpo-std-normalization"])
+
+    # On the command line: the sentinel is gone even though the flag text
+    # reads `disable_grpo_std_normalization`.
+    assert parsed.grpo_std_normalization is not module._CLI_ABSENT
+    assert parsed.grpo_std_normalization is False
+    # Not on the command line: still the sentinel, for the config file to fill.
+    assert parsed.normalize_advantages is module._CLI_ABSENT
+
+    # `_materialize_custom_config` turns the sentinel check into "did the
+    # command line supply this?". Reverting to name matching would fill both.
+    filled = module._materialize_custom_config(parsed, custom_config)
+    assert filled == {"normalize_advantages"}
+    assert parsed.grpo_std_normalization is False
+    assert parsed.normalize_advantages is True
+
+
+@pytest.mark.unit
+def test_custom_config_placeholder_is_materialized_before_validation(monkeypatch):
+    """Validation reads every field before the config file is applied again.
+
+    A placeholder is truthy and not None, so `rollout_temperature <= 0` raises
+    TypeError on it and `is not None` guards take the wrong branch. The config
+    value has to be in place before `slime_validate_args` looks at anything.
+    """
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(rollout_temperature=module._CLI_ABSENT)
+
+    module._materialize_custom_config(args, {"rollout_temperature": 0.5})
+    args, _ = module.slime_validate_args(args)
+
+    assert args.rollout_temperature == 0.5
+
+
+@pytest.mark.unit
+def test_custom_config_placeholder_survives_append_arguments(monkeypatch):
+    """`action="append"` builds on whatever the default holds.
+
+    `--rollout-sample-hook-path` is append. A placeholder argparse cannot
+    append to dies inside parsing, so the sentinel has to be one it accepts.
+    """
+    module = load_slime_arguments_module(monkeypatch)
+    custom_config = {"rollout_sample_hook_path": ["hooks.from_config"]}
+    absent_defaults = {key: module._CLI_ABSENT for key in custom_config}
+
+    parser = argparse.ArgumentParser(add_help=False)
+    module.get_slime_extra_args_provider(extra_defaults=absent_defaults)(parser)
+
+    given, _ = parser.parse_known_args(["--rollout-batch-size", "1", "--rollout-sample-hook-path", "hooks.from_cli"])
+    assert module._materialize_custom_config(given, custom_config) == set()
+    assert given.rollout_sample_hook_path == ["hooks.from_cli"]
+
+    omitted, _ = parser.parse_known_args(["--rollout-batch-size", "1"])
+    assert module._materialize_custom_config(omitted, custom_config) == {"rollout_sample_hook_path"}
+    assert omitted.rollout_sample_hook_path == ["hooks.from_config"]
+
+
+@pytest.mark.unit
+def test_megatron_parse_args_materializes_config_before_deriving_defaults(monkeypatch):
+    """The wiring between parsing and the derived defaults.
+
+    `max_position_embeddings` is derived from `seq_length`, so a config file
+    that sets `seq_length` only reaches the derivation if the placeholder is
+    replaced first. A placeholder left in place would derive 4096 instead.
+    """
+    module = load_arguments_module(monkeypatch)
+    custom_config = {
+        "grpo_std_normalization": True,  # also on the command line
+        "seq_length": 8192,  # config only; drives the derived default
+        "rollout_temperature": 0.5,  # config only
+    }
+
+    parsed = types.SimpleNamespace(
+        grpo_std_normalization=False,  # the command line said so
+        seq_length=None,  # placeholder
+        rollout_temperature=None,  # placeholder
+        fp16=False,
+        max_position_embeddings=None,
+        rope_type=None,
+        multi_latent_attention=False,
+        vocab_size=None,
+        padded_vocab_size=None,
+        tokenizer_model=None,
+        tokenizer_type=None,
+        hf_checkpoint=None,
+        actor_num_nodes=1,
+        actor_num_gpus_per_node=8,
+    )
+    monkeypatch.setattr(module, "_megatron_parse_args", lambda **kwargs: parsed)
+
+    args = module.megatron_parse_args(
+        extra_args_provider=lambda parser: parser,
+        skip_hf_validate=True,
+        custom_config=custom_config,
+    )
+
+    # The command line kept its value; the config filled the rest.
+    assert args.grpo_std_normalization is False
+    assert args.seq_length == 8192
+    assert args.rollout_temperature == 0.5
+    # Derived from the config value, not from the placeholder.
+    assert args.max_position_embeddings == 8192
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

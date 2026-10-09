@@ -16,6 +16,67 @@ from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_config
 
 logger = logging.getLogger(__name__)
 
+# Sentinel used as the argparse default for every key that appears in the
+# --custom-config-path YAML. argparse gives values from the command line
+# priority over defaults, so "is this still the sentinel?" is a reliable way
+# to learn which keys the command line actually provided.
+#
+# Matching flag text against YAML keys instead gets `--disable-foo` wrong:
+# argparse maps that flag to dest `foo`, so the two names never line up.
+#
+# The sentinel has to be None, not a private object. `action="append"` builds
+# on whatever the default holds, and `_copy_items(None)` is the only form
+# argparse turns into an empty list -- `--rollout-sample-hook-path` would
+# otherwise call .append() on the placeholder and die inside argparse. None
+# also reads as "unset" rather than as a real value if it ever escapes.
+#
+# That makes None an unreliable sentinel for a flag the command line can
+# resolve to None: `nargs='?'` with no value, `store_const` with `const=None`,
+# a `type=` returning None. No such flag exists today; if one appears, give it
+# a different marker.
+_CLI_ABSENT = None
+
+
+def _load_custom_config(path):
+    """Return the --custom-config-path YAML as a dict, or {} when unset/empty."""
+    if not path:
+        return {}
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _probe_custom_config_path():
+    """Read --custom-config-path before the main parse.
+
+    The YAML has to be known up front so its keys can become parser defaults
+    before any argument is parsed. This probe uses its own throwaway parser
+    and never consumes the flag, so the real parse still sees it.
+    """
+    probe = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    probe.add_argument("--custom-config-path", type=str, default=None)
+    ns, _ = probe.parse_known_args()
+    return ns.custom_config_path
+
+
+def _materialize_custom_config(namespace, custom_config):
+    """Replace sentinel placeholders with the custom config values.
+
+    A parsed value is `_CLI_ABSENT` exactly when the command line did not
+    provide that key. Everything downstream reads these fields -- validation,
+    derived defaults, flow control -- and a placeholder is truthy and not
+    None, so it has to become a real value before any of that runs.
+
+    Returns the keys this filled in. A caller that merges several namespaces
+    has to leave those keys alone: the value only stands in for a key another
+    parser owns, and merging it would clobber that parser's command-line value.
+    """
+    filled = set()
+    for key, value in custom_config.items():
+        if getattr(namespace, key, None) is _CLI_ABSENT:
+            setattr(namespace, key, value)
+            filled.add(key)
+    return filled
+
 
 def reset_arg(parser, name, **kwargs):
     """
@@ -33,7 +94,7 @@ def reset_arg(parser, name, **kwargs):
         parser.add_argument(name, **kwargs)
 
 
-def get_slime_extra_args_provider(add_custom_arguments=None):
+def get_slime_extra_args_provider(add_custom_arguments=None, extra_defaults=None):
     def add_slime_arguments(parser):
         # Ray
         def add_cluster_arguments(parser):
@@ -1691,12 +1752,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         if parser.get_default("async_strategy") is not None:
             parser.set_defaults(async_strategy="mcore")
 
+        if extra_defaults:
+            parser.set_defaults(**extra_defaults)
+
         return parser
 
     return add_slime_arguments
 
 
-def _pre_parse_mode():
+def _pre_parse_mode(extra_defaults=None):
     """Pre-parse CLI to extract arguments that control parsing flow.
 
     These arguments are removed from add_slime_arguments to avoid
@@ -1708,6 +1772,8 @@ def _pre_parse_mode():
     temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
     temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
     temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
+    if extra_defaults:
+        temp_parser.set_defaults(**extra_defaults)
     temp_args, _ = temp_parser.parse_known_args()
     return temp_args
 
@@ -1721,16 +1787,24 @@ def parse_args(add_custom_arguments=None, *, return_restore_plan=False):
     # Users may call `parse_args` very early, thus we ensure logger is configured here
     configure_logger()
 
-    add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
+    # Read the custom config up front: its keys become argparse defaults, so
+    # values from the command line win without any flag-name guessing.
+    custom_config = _load_custom_config(_probe_custom_config_path())
+    absent_defaults = {key: _CLI_ABSENT for key in custom_config}
 
-    pre = _pre_parse_mode()
+    add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments, extra_defaults=absent_defaults)
+
+    pre = _pre_parse_mode(extra_defaults=absent_defaults)
+    pre_filled = _materialize_custom_config(pre, custom_config)
     skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None
 
     # Phase 1: Parse sglang args independently (separate parser, parse_known_args).
     # Skipped when sglang servers are not needed.
     sglang_ns = None
+    sglang_filled = set()
     if not skip_sglang:
-        sglang_ns = sglang_parse_args()
+        sglang_ns = sglang_parse_args(extra_defaults=absent_defaults)
+        sglang_filled = _materialize_custom_config(sglang_ns, custom_config)
 
     # Phase 2: Parse megatron + slime args.
     # Uses ignore_unknown_args=True so that --sglang-* and pre-parsed CLI flags
@@ -1741,16 +1815,29 @@ def parse_args(add_custom_arguments=None, *, return_restore_plan=False):
     args = megatron_parse_args(
         extra_args_provider=add_slime_arguments,
         skip_hf_validate=pre.debug_rollout_only,
+        custom_config=custom_config,
     )
 
-    # Merge pre-parsed args into the main namespace
+    # Merge pre-parsed args into the main namespace. A key that materialized
+    # only stands in for one another parser owns, so merging it would clobber
+    # that parser's command-line value.
     for key, value in vars(pre).items():
+        if key in pre_filled:
+            continue
         setattr(args, key, value)
 
     # Merge sglang args into the main namespace
     if sglang_ns is not None:
         for key, value in vars(sglang_ns).items():
+            if key in sglang_filled:
+                continue
             setattr(args, key, value)
+
+    for key, value in custom_config.items():
+        if getattr(args, key, None) == value:
+            logger.info("Custom config set %s = %r.", key, value)
+        else:
+            logger.info("Command line overrides custom config %s = %r.", key, value)
 
     args, restore_plan = slime_validate_args(args)
 
@@ -2184,14 +2271,6 @@ def slime_validate_args(args):
         args.use_routing_replay = True
         if args.routing_replay_prefetch_microbatches < 0:
             raise ValueError("--routing-replay-prefetch-microbatches must be non-negative")
-
-    if args.custom_config_path:
-        with open(args.custom_config_path) as f:
-            data = yaml.safe_load(f) or {}
-        for k, v in data.items():
-            if hasattr(args, k):
-                logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
-            setattr(args, k, v)
 
     if args.eval_max_context_len is None:
         logger.info(

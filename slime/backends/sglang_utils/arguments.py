@@ -200,11 +200,15 @@ def validate_args(args):
     ), "sglang_config and prefill_num_servers are mutually exclusive. Use server_groups in the YAML config instead."
 
 
-def sglang_parse_args():
+def sglang_parse_args(extra_defaults=None):
     """
     Parse sglang server arguments independently using a separate ArgumentParser.
     Uses parse_known_args() to only consume sglang-related arguments from sys.argv,
     allowing the remaining arguments to be parsed by megatron separately.
+
+    ``extra_defaults`` overrides the computed defaults below. It carries the
+    sentinel defaults for --custom-config-path keys, which is what lets the
+    caller tell a command-line value from a default.
 
     Returns:
         argparse.Namespace: Parsed sglang arguments (all attributes prefixed with sglang_).
@@ -221,6 +225,8 @@ def sglang_parse_args():
     pp_size = temp_args.sglang_pp_size if temp_args.sglang_pp_size != 1 else temp_args.sglang_pipeline_parallel_size
     sglang_tp_size = temp_args.rollout_num_gpus_per_engine // pp_size
     parser.set_defaults(sglang_tensor_parallel_size=sglang_tp_size)
+    if extra_defaults:
+        parser.set_defaults(**extra_defaults)
 
     args, _ = parser.parse_known_args()
     return args

@@ -148,13 +148,25 @@ def _hf_validate_args(args, hf_config):
         raise AssertionError("hf_validate_args failed: " + "; ".join(errors))
 
 
-def _set_default_megatron_args(args):
+def _set_default_megatron_args(args, configured=()):
+    """Apply slime's Megatron defaults.
+
+    ``configured`` names keys the --custom-config-path file set. Those are user
+    input, so they win over a framework default. The `is None` branches below
+    already yield to a value that is present; only the unconditional
+    assignments need the guard.
+    """
+
+    def _default(name, value):
+        if name not in configured:
+            setattr(args, name, value)
+
     # Megatron 0.19 validates MTP before resolving this legacy RoPE flag.
     # Normalize it here for both training and checkpoint conversion.
     if getattr(args, "use_rotary_position_embeddings", False):
         args.position_embedding_type = "rope"
     # always use zero optimizer
-    args.use_distributed_optimizer = True
+    _default("use_distributed_optimizer", True)
     if hasattr(args, "mtp_detach_heads"):
         args.mtp_detach_heads = True
     if hasattr(args, "trust_remote_code"):
@@ -162,12 +174,12 @@ def _set_default_megatron_args(args):
     if not hasattr(args, "enable_gloo_process_groups"):
         args.enable_gloo_process_groups = True
     # TODO: maybe change this after megatron has good fp8 support
-    args.bf16 = not args.fp16
+    _default("bf16", not args.fp16)
     # Checkpoint I/O defaults: these keep checkpoint contents unchanged while
     # reducing repeated validation/planning work and parallelizing load.
-    args.use_persistent_ckpt_worker = True
-    args.ckpt_assume_constant_structure = True
-    args.ckpt_fully_parallel_load = True
+    _default("use_persistent_ckpt_worker", True)
+    _default("ckpt_assume_constant_structure", True)
+    _default("ckpt_fully_parallel_load", True)
     # placeholders
     if args.seq_length is None:
         args.seq_length = 4096
@@ -176,7 +188,7 @@ def _set_default_megatron_args(args):
     if args.max_position_embeddings is None:
         args.max_position_embeddings = args.seq_length
     # TODO: revisit this when megatron(dev) have solved the optimizer-cpu-offload ckpt saving bug
-    args.dist_ckpt_save_pre_mcore_014 = True
+    _default("dist_ckpt_save_pre_mcore_014", True)
     # compatible for megatron
     if hasattr(args, "rope_type") and args.rope_type is None:
         args.rope_type = "yarn" if args.multi_latent_attention else "rope"
@@ -198,9 +210,20 @@ def _set_default_megatron_args(args):
 set_default_megatron_args = _set_default_megatron_args
 
 
-def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
-    """Parse megatron args, validate HF config, and set defaults."""
+def megatron_parse_args(extra_args_provider, skip_hf_validate=False, custom_config=None):
+    """Parse megatron args, validate HF config, and set defaults.
+
+    ``custom_config`` values land here, before the HF check and the derived
+    defaults read these fields. Until they land they are placeholders, and a
+    placeholder reads as a value: `seq_length` would then derive the wrong
+    `max_position_embeddings`. A key the command line supplied is already set,
+    so it wins.
+    """
     args = _megatron_parse_args(extra_args_provider=extra_args_provider, ignore_unknown_args=True)
+
+    for key, value in (custom_config or {}).items():
+        if getattr(args, key, None) is None:
+            setattr(args, key, value)
 
     hf_config = None
     if args.hf_checkpoint and not skip_hf_validate:
@@ -212,5 +235,5 @@ def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
 
     args.rank = 0
     args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
-    args = _set_default_megatron_args(args)
+    args = _set_default_megatron_args(args, configured=set(custom_config or ()))
     return args
